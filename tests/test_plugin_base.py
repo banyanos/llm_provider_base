@@ -94,6 +94,15 @@ def test_emit_suffix_extends_group_id() -> None:
     assert recorded[0]["message_group_id"] == "t-r-reasoning"
 
 
+def test_emit_kind_marks_reasoning_chunks() -> None:
+    recorded = []
+    ctx = ProviderContext(emit=lambda c: recorded.append(dict(c)), trace_id="t")
+    handler = _handler(ctx=ctx)
+    handler.send_data_to_stream(index=0, chunk_delta="why", suffix="rs#0")
+    handler.send_data_to_stream(index=1, chunk_delta="answer")
+    assert [c["kind"] for c in recorded] == ["reasoning", "text"]
+
+
 def test_emit_without_ctx_is_noop() -> None:
     handler = _handler()
     handler.send_data_to_stream(index=0, chunk_delta="x")  # must not raise
@@ -189,3 +198,69 @@ def test_aws_and_mcp_initializers_are_gone() -> None:
     ):
         assert not hasattr(LlmProviderHandler, name), name
     assert not hasattr(LlmProviderHandler, "task_queue")
+
+
+def test_fetch_upstream_models_maps_items_and_errors() -> None:
+    from types import SimpleNamespace
+
+    import pytest
+
+    from llm_provider_base import bearer, endpoint_base, fetch_upstream_models
+
+    class _Resp:
+        def __init__(self, status, body):
+            self.status_code, self._body = status, body
+
+        def json(self):
+            return self._body
+
+    calls = []
+
+    class _Client:
+        def __init__(self, resp):
+            self.resp = resp
+
+        def get(self, url, headers=None, params=None, timeout=None):
+            calls.append((url, headers))
+            return self.resp
+
+    ctx = SimpleNamespace(
+        http_client=_Client(_Resp(200, {"models": [{"name": "models/a"}, {"name": ""}, "x"]})),
+        endpoint="https://h/v1/", credentials={"api_key": "k"}, timeout_seconds=5,
+    )
+    assert endpoint_base(ctx) == "https://h/v1"
+    assert bearer(ctx) == {"Authorization": "Bearer k"}
+    models = fetch_upstream_models(
+        ctx, "https://h/m", items_key="models", id_key="name", strip_prefix="models/"
+    )
+    assert models == [{"model_id": "a", "name": "models/a"}]
+    for status, msg in ((401, "Authentication"), (404, "not found"), (500, "Upstream")):
+        ctx.http_client = _Client(_Resp(status, {}))
+        with pytest.raises(RuntimeError, match=msg):
+            fetch_upstream_models(ctx, "https://h/m")
+
+
+def test_default_test_connection_uses_list_models() -> None:
+    from llm_provider_base import LlmProviderHandler
+
+    class _Ok(LlmProviderHandler):
+        @classmethod
+        def list_models(cls, ctx):
+            return [{"model_id": "m", "name": "m"}]
+
+    class _Bad(LlmProviderHandler):
+        @classmethod
+        def list_models(cls, ctx):
+            raise RuntimeError("Authentication failed (HTTP 401)")
+
+    class _Unsupported(LlmProviderHandler):
+        @classmethod
+        def list_models(cls, ctx):
+            return None
+
+    ok = _Ok.test_connection(object())
+    assert ok["success"] is True and ok["http_status"] == 200
+    bad = _Bad.test_connection(object())
+    assert bad["success"] is False and "401" in bad["error_message"]
+    assert _Unsupported.test_connection(object()) is None
+    assert LlmProviderHandler.test_connection(object()) is None

@@ -75,6 +75,66 @@ class ProviderContext:
     pool_name: Optional[str] = None
 
 
+def fetch_upstream_models(
+    ctx: Any,
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, str]] = None,
+    items_key: str = "data",
+    id_key: str = "id",
+    strip_prefix: str = "",
+) -> List[Dict[str, str]]:
+    """Shared ``list_models`` helper for provider plugins.
+
+    llm_engine's ``fetchAvailableModels`` hands each plugin's ``list_models``
+    a probe context (``http_client`` from a short-lived pool, ``endpoint``,
+    ``credentials``, ``timeout_seconds``). This performs the GET, maps HTTP
+    failures to readable errors and returns ``[{"model_id", "name"}]``.
+    """
+    response = ctx.http_client.get(
+        url,
+        headers=headers or {},
+        params=params or None,
+        timeout=getattr(ctx, "timeout_seconds", None),
+    )
+    status = response.status_code
+    if status in (401, 403):
+        raise RuntimeError(f"Authentication failed (HTTP {status})")
+    if status == 404:
+        raise RuntimeError(f"Endpoint not found (HTTP 404): {url}")
+    if status >= 400:
+        raise RuntimeError(f"Upstream error (HTTP {status})")
+    try:
+        body = response.json()
+    except Exception as exc:  # noqa: BLE001 — non-JSON upstream body
+        raise RuntimeError(f"Invalid model list response: {exc}") from exc
+    models: List[Dict[str, str]] = []
+    for item in (body or {}).get(items_key) or []:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get(id_key) or "")
+        if strip_prefix and model_id.startswith(strip_prefix):
+            model_id = model_id[len(strip_prefix):]
+        if model_id:
+            models.append(
+                {"model_id": model_id, "name": str(item.get("display_name") or item.get("name") or model_id)}
+            )
+    return models
+
+
+def endpoint_base(ctx: Any, default: str = "") -> str:
+    """The probe/model endpoint without a trailing slash."""
+    return str(getattr(ctx, "endpoint", None) or default).strip().rstrip("/")
+
+
+def bearer(ctx: Any) -> Dict[str, str]:
+    """``Authorization: Bearer`` from ``ctx.credentials`` (empty when unset)."""
+    creds = getattr(ctx, "credentials", None) or {}
+    key = str(creds.get("api_key") or creds.get("openai_api_key") or "").strip()
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 class LlmProviderHandler:
     """Base class for LLM provider handler plugins.
 
@@ -214,6 +274,38 @@ class LlmProviderHandler:
             "pool_name": cls.default_pool_name,
         }
 
+    @classmethod
+    def test_connection(cls, ctx: Any) -> Optional[Dict[str, Any]]:
+        """Upstream connectivity probe for ``testModelConnection``.
+
+        Default: time one ``list_models`` call (authenticated, cheap, no
+        tokens spent). Returns ``None`` when the provider cannot list models,
+        so llm_engine falls back to its own probe.
+        """
+        import time
+
+        list_models = getattr(cls, "list_models", None)
+        if not callable(list_models):
+            return None
+        started = time.monotonic()
+        try:
+            models = list_models(ctx)
+        except Exception as exc:  # noqa: BLE001 — reported, not raised
+            return {
+                "success": False,
+                "latency_ms": int((time.monotonic() - started) * 1000),
+                "error_message": str(exc),
+                "http_status": 0,
+            }
+        if models is None:
+            return None
+        return {
+            "success": True,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "error_message": None,
+            "http_status": 200,
+        }
+
     # ------------------------------------------------------------------
     # Model call (subclass contract)
     # ------------------------------------------------------------------
@@ -308,6 +400,9 @@ class LlmProviderHandler:
         data = {
             "message_group_id": message_group_id,
             "event_type": "chunk",
+            # Providers tag reasoning chunks with an ``rs#<n>`` suffix; the
+            # host forwards them as ``reasoning`` events (opt-in per request).
+            "kind": "reasoning" if suffix.startswith("rs#") else "text",
             "data_format": data_format,
             "index": index,
             "chunk_delta": chunk_delta,
